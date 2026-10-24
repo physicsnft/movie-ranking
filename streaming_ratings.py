@@ -34,6 +34,8 @@ HOW THE DATA FILLS IN
   * Star a movie to add it to your favourites. The Favourites view shows
     their current scores and which of your loaded catalogs they're on.
     Favourites are saved in data/favourites.json.
+  * Mark a movie as seen to hide it from the list. It moves to the
+    Already seen view, saved in data/seen.json.
   * Everything stays on your computer. The site only listens on
     localhost, so other devices on your network can't reach it.
 """
@@ -231,6 +233,8 @@ class App:
         self.lists = Store(os.path.join(DATA, "lists.json"))
         self.usage = Store(os.path.join(DATA, "omdb_usage.json"))
         self.favs = Store(os.path.join(DATA, "favourites.json"))
+        self.seen = Store(os.path.join(DATA, "seen.json"))
+        self.marks = {"favourites": self.favs, "seen": self.seen}
         self.id_sets = {}
         self.catalogs = {}
         self.cat_lock = threading.Lock()
@@ -246,7 +250,7 @@ class App:
             self.save_all()
 
     def save_all(self):
-        for s in (self.details, self.scores, self.lists, self.usage, self.favs):
+        for s in (self.details, self.scores, self.lists, self.usage, self.favs, self.seen):
             try:
                 s.save()
             except OSError:
@@ -475,10 +479,10 @@ class App:
                 index.setdefault(mid, []).append(key)
         return index
 
-    def favourites(self):
+    def list_items(self, name):
         index = self.availability_index()
         out = []
-        for fid, f in self.favs.items():
+        for fid, f in self.marks[name].items():
             mid = int(fid)
             d = self.details.get(fid) or {}
             imdb_id = d.get("imdb_id") or f.get("imdb_id")
@@ -510,7 +514,8 @@ class App:
             })
         return out
 
-    def add_favourite(self, body):
+    def add_item(self, name, body):
+        store = self.marks[name]
         mid = int(body["tmdb_id"])
         country = str(body.get("country") or "")[:2].upper()
         try:
@@ -519,7 +524,7 @@ class App:
             service = None
         clip = lambda v: (str(v)[:300] if v is not None else None)
         year = body.get("year")
-        self.favs.set(str(mid), {
+        store.set(str(mid), {
             "added": time.time(),
             "title": clip(body.get("title")),
             "title_local": clip(body.get("title_local")),
@@ -530,11 +535,15 @@ class App:
             "country": country if re.fullmatch(r"[A-Z]{2}", country) else None,
             "service": service,
         })
-        self.favs.save()
+        store.save()
 
-    def remove_favourite(self, mid):
-        self.favs.pop(str(int(mid)))
-        self.favs.save()
+    def remove_item(self, name, mid):
+        store = self.marks[name]
+        store.pop(str(int(mid)))
+        store.save()
+
+    def list_ids(self, name):
+        return [int(k) for k, _ in self.marks[name].items()]
 
     # ---- OMDb daily budget
 
@@ -641,7 +650,7 @@ def make_handler(app):
             try:
                 if path == "/":
                     boot = {"country": app.cfg.get("last_country", "ES"), "service": app.cfg.get("last_service", 8),
-                            "favs": [int(k) for k, _ in app.favs.items()]}
+                            "favs": app.list_ids("favourites"), "seen": app.list_ids("seen")}
                     self.send(200, PAGE.replace("__BOOT__", json.dumps(boot)), "text/html; charset=utf-8")
                 elif path == "/api/regions":
                     self.json({"regions": app.regions()})
@@ -654,8 +663,12 @@ def make_handler(app):
                     self.catalog()
                 elif path == "/api/scores":
                     self.scores()
-                elif path == "/api/favourites":
-                    self.json({"favourites": app.favourites()})
+                elif path == "/api/list":
+                    _, _, _, q = self.params()
+                    name = q.get("name", [""])[0]
+                    if name not in app.marks:
+                        return self.json({"error": "Unknown list."}, 400)
+                    self.json({"items": app.list_items(name)})
                 else:
                     self.send(404, "Not found", "text/plain; charset=utf-8")
             except ApiError as e:
@@ -677,18 +690,21 @@ def make_handler(app):
                     raise ValueError
             except (ValueError, json.JSONDecodeError):
                 return self.json({"error": "That request couldn't be read."}, 400)
+            name = body.get("list")
+            if name not in app.marks:
+                return self.json({"error": "Unknown list."}, 400)
             try:
-                if path == "/api/favourites/add":
-                    app.add_favourite(body)
-                elif path == "/api/favourites/remove":
-                    app.remove_favourite(body["tmdb_id"])
+                if path == "/api/list/add":
+                    app.add_item(name, body)
+                elif path == "/api/list/remove":
+                    app.remove_item(name, body["tmdb_id"])
                 else:
                     return self.send(404, "Not found", "text/plain; charset=utf-8")
             except (KeyError, TypeError, ValueError):
                 return self.json({"error": "That request is missing the movie."}, 400)
             except OSError:
-                return self.json({"error": "Your favourites couldn't be saved. Check the data folder can be written to."}, 500)
-            self.json({"ok": True, "ids": [int(k) for k, _ in app.favs.items()]})
+                return self.json({"error": "That change couldn't be saved. Check the data folder can be written to."}, 500)
+            self.json({"ok": True, "ids": app.list_ids(name)})
 
         def catalog(self):
             country, pid, _, q = self.params()
@@ -905,8 +921,23 @@ nav.views { display: inline-flex; gap: 4px; padding: 4px; background: var(--chip
 .avail { font-size: 11.5px; font-weight: 600; border-radius: 4px; padding: 1px 6px; color: var(--fresh); background: var(--fresh-bg); }
 .avail.gone { color: var(--low); background: var(--low-bg); }
 .avail.unknown { color: var(--muted); background: var(--chip); }
-body.favs .source, body.favs .allonly { display: none !important; }
-body.favs .controls { grid-template-columns: 2fr minmax(0, 1fr); max-width: 640px; }
+body.listview .source, body.listview .allonly { display: none !important; }
+body.listview .controls { grid-template-columns: 2fr minmax(0, 1fr); max-width: 640px; }
+.mark { background: none; border: 0; padding: 2px; margin-left: 2px; cursor: pointer; vertical-align: -3px; color: var(--muted); border-radius: 4px; line-height: 0; }
+.mark svg { width: 19px; height: 19px; display: block; }
+.mark svg path, .mark svg circle { fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.mark:hover, .mark[aria-pressed="true"] { color: var(--accent); }
+.avail.seen { color: var(--accent); background: var(--chip); }
+.toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(20px + env(safe-area-inset-bottom)); z-index: 20;
+  background: var(--ink); color: var(--bg); border-radius: 8px; padding: 10px 10px 10px 16px; font-size: 14px;
+  display: flex; gap: 14px; align-items: center; max-width: calc(100% - 32px); box-shadow: 0 6px 24px rgba(0,0,0,.25); }
+.toast span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.toast button { font: 600 14px/1 var(--f-body); background: none; border: 1px solid currentColor; color: inherit; border-radius: 6px; padding: 8px 12px; cursor: pointer; flex: none; }
+.tab { white-space: nowrap; }
+@media (max-width: 420px) {
+  nav.views { display: flex; max-width: 100%; overflow-x: auto; }
+  .tab { flex: 1 1 auto; justify-content: center; font-size: 13px; padding: 8px 7px; gap: 5px; }
+}
 footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76ch; }
 @media (prefers-reduced-motion: reduce) { .bar span { transition: none; } }
 </style>
@@ -916,6 +947,7 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
   <nav class="views" role="tablist" aria-label="View">
     <button class="tab" type="button" role="tab" id="tabAll" aria-selected="true">All movies</button>
     <button class="tab" type="button" role="tab" id="tabFavs" aria-selected="false">Favourites <span class="badge" id="favCount">0</span></button>
+    <button class="tab" type="button" role="tab" id="tabSeen" aria-selected="false">Already seen <span class="badge" id="seenCount">0</span></button>
   </nav>
   <div class="source">
     <div class="field"><label for="country">Country</label><select id="country"><option>Loading…</option></select></div>
@@ -981,6 +1013,7 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
     This product uses the TMDB API but is not endorsed or certified by TMDB.
   </footer>
 </div>
+<div class="toast" id="toast" role="status" hidden><span id="toastMsg"></span><button type="button" id="toastUndo">Undo</button></div>
 
 <script>
 (function () {
@@ -991,11 +1024,26 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
   var els = { country: $("country"), service: $("service"), q: $("q"), sort: $("sort"), genre: $("genre"),
     votes: $("votes"), from: $("from"), needRt: $("needRt"), hideAnim: $("hideAnim") };
   var state = { country: BOOT.country, service: BOOT.service, movies: [], byImdb: {}, since: 0, shown: PAGE, token: 0,
-    serviceName: "", countryName: "", fetched: 0, scorer: null,
-    view: "all", favIds: {}, favMovies: [], favLoaded: false, favSort: "overall", allSort: null };
-  (BOOT.favs || []).forEach(function (id) { state.favIds[id] = true; });
+    serviceName: "", countryName: "", fetched: 0, scorer: null, view: "all", allSort: "overall" };
+
+  // The two personal lists. Both are kept by the local server in the data folder.
+  var LISTS = {
+    favs: { api: "favourites", hash: "#favourites", tab: "tabFavs", badge: "favCount", sort: "overall", sortLabel: "Recently added",
+      heading: ["Your", "favourites"], title: "Favourites", ids: {}, movies: [],
+      empty: "No favourites yet. Tap the star next to a movie's title to add it here.",
+      emptySearch: "No favourites match your search." },
+    seen: { api: "seen", hash: "#seen", tab: "tabSeen", badge: "seenCount", sort: "added", sortLabel: "Recently seen",
+      heading: ["Already", "seen"], title: "Already seen", ids: {}, movies: [],
+      empty: "Nothing here yet. Tap the eye next to a movie's title once you've seen it, and it moves here from the list.",
+      emptySearch: "No seen movies match your search." }
+  };
+  (BOOT.favs || []).forEach(function (id) { LISTS.favs.ids[id] = true; });
+  (BOOT.seen || []).forEach(function (id) { LISTS.seen.ids[id] = true; });
+
   var STAR = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.2l2.7 5.6 6.1.8-4.5 4.2 1.1 6.1L12 17l-5.4 2.9 1.1-6.1-4.5-4.2 6.1-.8z"/></svg>';
-  var timers = { job: null, scores: null };
+  var EYE = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="3"/></svg>';
+  var EYE_ON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><path d="M9.2 12.1l2 2 3.7-4"/></svg>';
+  var timers = { job: null, scores: null, toast: null };
 
   // ---------- helpers
   function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); }
@@ -1014,6 +1062,8 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
     if (v >= 1e3) return Math.round(v / 1e3) + "k votes";
     return v + " votes";
   }
+  function fmtDay(t) { return new Date(t * 1000).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" }); }
+  function prep(m) { m._o = overall(m); m._s = [m.title, m.title_local, m.original_title].join(" ").toLowerCase(); }
   function api(path, params) {
     var qs = Object.keys(params || {}).map(function (k) { return k + "=" + encodeURIComponent(params[k]); }).join("&");
     return fetch(path + (qs ? "?" + qs : ""), { cache: "no-store" }).then(function (r) {
@@ -1023,6 +1073,11 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
       });
     }, function () { throw new Error("The site can't reach its local server. Is streaming_ratings.py still running? Start it again, then reload this page."); });
   }
+  function post(path, body) {
+    return fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
+      .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { if (!r.ok) throw new Error(j.error || "Error " + r.status); return j; }); },
+        function () { throw new Error("Is streaming_ratings.py still running?"); });
+  }
   function showNote(text, isErr, retry) {
     var el = $("note");
     el.hidden = false; el.className = "note" + (isErr ? " err" : "");
@@ -1030,12 +1085,14 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
     if (retry) $("retryBtn").addEventListener("click", function () { loadCatalog(true); });
   }
   function hideNote() { $("note").hidden = true; }
+  function listView() { return state.view === "all" ? null : LISTS[state.view]; }
   function setHeading() {
-    if (state.view === "favs") {
-      $("hService").textContent = "Your";
-      $("hCountry").textContent = "favourites";
+    var L = listView();
+    if (L) {
+      $("hService").textContent = L.heading[0];
+      $("hCountry").textContent = L.heading[1];
       $("hBy").hidden = true;
-      document.title = "Favourites · Streaming by Rating";
+      document.title = L.title + " · Streaming by Rating";
       return;
     }
     $("hBy").hidden = false;
@@ -1071,6 +1128,7 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
     });
   }
   function selectedText(sel) { var o = sel.options[sel.selectedIndex]; return o ? o.textContent : ""; }
+  function syncNames() { state.serviceName = selectedText(els.service); state.countryName = selectedText(els.country); }
 
   els.country.addEventListener("change", function () {
     state.country = els.country.value;
@@ -1084,7 +1142,7 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
 
   // ---------- catalog
   function showLoading(job) {
-    if (state.view === "favs") return;
+    if (state.view !== "all") return;
     $("results").hidden = true; $("loading").hidden = false;
     var pct = 0, msg = "Getting the " + state.serviceName + " catalog for " + state.countryName + "…", sub = "This takes a minute or so the first time. After that it's instant.";
     if (job && job.step === "catalog" && job.total) { pct = 50 * job.done / job.total; sub = "Page " + n(job.done) + " of " + n(job.total) + " of the catalog."; }
@@ -1102,10 +1160,11 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
     hideNote();
     if (!state.service) { $("results").hidden = true; $("loading").hidden = true; showNote("TMDB lists no streaming services for this country.", false); return; }
     var token = ++state.token;
-    state.serviceName = selectedText(els.service); state.countryName = selectedText(els.country);
+    syncNames();
     setHeading();
     $("status").textContent = "";
-    try { history.replaceState(null, "", "?country=" + state.country + "&service=" + state.service + (state.view === "favs" ? "#favourites" : "")); } catch (e) {}
+    var L = listView();
+    try { history.replaceState(null, "", "?country=" + state.country + "&service=" + state.service + (L ? L.hash : "")); } catch (e) {}
     var params = { country: state.country, service: state.service };
     if (retry) params.retry = 1;
     api("/api/catalog", params).then(function (j) {
@@ -1133,7 +1192,7 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
     state.movies = j.movies; state.fetched = j.fetched; state.since = j.now || 0; state.shown = PAGE;
     state.byImdb = {};
     state.movies.forEach(function (m) {
-      m._o = overall(m); m._s = [m.title, m.title_local, m.original_title].join(" ").toLowerCase();
+      prep(m);
       if (m.imdb_id) (state.byImdb[m.imdb_id] = state.byImdb[m.imdb_id] || []).push(m);
     });
     buildGenres();
@@ -1150,7 +1209,7 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
         if (j.job && j.job.state === "running") watchRefresh(token);
         else if (j.job && j.job.state === "done" && j.fetched > state.fetched) {
           api("/api/catalog", { country: state.country, service: state.service }).then(function (k) {
-            if (token === state.token && k.movies) { var keep = state.shown; useCatalog(k); state.shown = keep; render(); }
+            if (token === state.token && k.movies) { var keep = state.shown; useCatalog(k); state.shown = keep; if (state.view === "all") render(); }
           });
         }
       }).catch(function () {});
@@ -1171,8 +1230,7 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
           changed = true;
         });
       });
-      if (changed && state.view === "all") render();
-      if (state.view === "all") updateStatus();
+      if (state.view === "all") { if (changed) render(); updateStatus(); }
       var busy = j.scorer.state === "running" && j.scorer.pending > 0;
       timers.scores = setTimeout(function () { pollScores(token); }, busy ? 8000 : 60000);
     }).catch(function () {
@@ -1183,8 +1241,10 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
   function updateStatus() {
     var total = state.movies.length;
     var scored = state.movies.filter(function (m) { return m._o != null; }).length;
+    var hidden = state.movies.filter(function (m) { return LISTS.seen.ids[m.tmdb_id]; }).length;
     var when = state.fetched ? new Date(state.fetched * 1000).toLocaleDateString("en-GB", { day: "numeric", month: "short" }) : "";
     var parts = ["<b>" + n(total) + "</b> movies", "<b>" + n(scored) + "</b> with scores"];
+    if (hidden) parts.push("<b>" + n(hidden) + "</b> already seen");
     var s = state.scorer;
     if (s && s.pending > 0) {
       if (s.state === "running") parts.push('<span class="live">● scoring ' + n(s.pending) + " more</span>");
@@ -1199,6 +1259,21 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
     } else if ($("note").className === "note") hideNote();
   }
 
+  function updateListStatus() {
+    var L = listView(), total = L.movies.length, parts;
+    if (state.view === "seen") {
+      parts = ["<b>" + n(total) + "</b> movie" + (total === 1 ? "" : "s") + " seen"];
+    } else {
+      var cur = state.country + "_" + state.service;
+      var here = L.movies.filter(function (m) { return (m.where || []).some(function (w) { return w.country + "_" + w.service === cur; }); }).length;
+      var gone = L.movies.filter(function (m) { return m.origin && !m.origin.available; }).length;
+      parts = ["<b>" + n(total) + "</b> favourite" + (total === 1 ? "" : "s")];
+      if (total && state.serviceName) parts.push("<b>" + n(here) + "</b> on " + esc(state.serviceName) + " · " + esc(state.countryName));
+      if (gone) parts.push("<b>" + n(gone) + "</b> no longer where you found " + (gone === 1 ? "it" : "them"));
+    }
+    $("status").innerHTML = parts.join(" · ");
+  }
+
   // ---------- list
   function buildGenres() {
     var genres = {}, cur = els.genre.value;
@@ -1211,10 +1286,11 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
 
   function filtered() {
     var q = els.q.value.trim().toLowerCase(), g = els.genre.value, minV = +els.votes.value, from = +els.from.value, key = els.sort.value;
-    var favView = state.view === "favs";
-    var list = (favView ? state.favMovies : state.movies).filter(function (m) {
+    var L = listView();
+    var list = (L ? L.movies : state.movies).filter(function (m) {
       if (q && m._s.indexOf(q) < 0) return false;
-      if (favView) return true;
+      if (L) return true;
+      if (LISTS.seen.ids[m.tmdb_id]) return false;
       if (g && (m.genres || []).indexOf(g) < 0) return false;
       if (minV && !(m.imdb_votes >= minV)) return false;
       if (from && !(m.year >= from)) return false;
@@ -1241,7 +1317,7 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
   }
 
   function watchLink(m) {
-    if (state.view === "favs") {
+    if (state.view !== "all") {
       var c = (m.origin && m.origin.country) || state.country;
       return '<a href="https://www.themoviedb.org/movie/' + m.tmdb_id + "/watch?locale=" + encodeURIComponent(c) + '" target="_blank" rel="noopener">Where to watch ↗</a>';
     }
@@ -1250,12 +1326,33 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
     return '<a href="https://www.themoviedb.org/movie/' + m.tmdb_id + "/watch?locale=" + encodeURIComponent(state.country) + '" target="_blank" rel="noopener">Where to watch ↗</a>';
   }
 
+  function availChips(m) {
+    var out = [];
+    if (m.origin && m.origin.label && !m.origin.available)
+      out.push('<span class="avail gone">No longer on ' + esc(m.origin.label) + "</span>");
+    (m.where || []).forEach(function (w) { out.push('<span class="avail">On ' + esc(w.label) + "</span>"); });
+    if (!out.length) out.push('<span class="avail unknown">Not on any catalog you\'ve loaded</span>');
+    return out;
+  }
+
+  function buttons(m) {
+    var fav = !!LISTS.favs.ids[m.tmdb_id], seen = !!LISTS.seen.ids[m.tmdb_id];
+    var favLabel = fav ? "Remove from favourites" : "Add to favourites";
+    var seenLabel = seen ? "Move back to the list (not seen)" : "Mark as seen";
+    return '<button type="button" class="star" data-list="favs" data-id="' + m.tmdb_id + '" aria-pressed="' + fav + '" aria-label="' + favLabel + '" title="' + favLabel + '">' + STAR + "</button>" +
+      '<button type="button" class="mark" data-list="seen" data-id="' + m.tmdb_id + '" aria-pressed="' + seen + '" aria-label="' + seenLabel + '" title="' + seenLabel + '">' + (seen ? EYE_ON : EYE) + "</button>";
+  }
+
   function render() {
-    var list = filtered(), out = [];
+    var list = filtered(), out = [], L = listView();
     $("count").textContent = n(list.length) + " match" + (list.length === 1 ? "" : "es");
     list.slice(0, state.shown).forEach(function (m, i) {
       var meta = [];
-      if (state.view === "favs") meta = meta.concat(availChips(m));
+      if (state.view === "seen" && m.added) meta.push('<span class="avail seen">Seen ' + esc(fmtDay(m.added)) + "</span>");
+      if (state.view === "favs") {
+        if (LISTS.seen.ids[m.tmdb_id]) meta.push('<span class="avail seen">Seen</span>');
+        meta = meta.concat(availChips(m));
+      }
       if (m.genres && m.genres.length) meta.push("<span>" + esc(m.genres.slice(0, 3).join(", ")) + "</span>");
       if (m.runtime) meta.push("<span>" + m.runtime + " min</span>");
       meta.push(watchLink(m));
@@ -1263,19 +1360,16 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
       if (m.overview) meta.push('<button type="button" data-plot="' + m.tmdb_id + '">Plot</button>');
       var local = m.title_local && m.title_local !== m.title ? '<div class="sub">' + esc(m.title_local) + "</div>" : "";
       var poster = m.poster ? '<img class="poster" loading="lazy" alt="" src="https://image.tmdb.org/t/p/w92' + esc(m.poster) + '">' : '<div class="poster"></div>';
-      var fav = !!state.favIds[m.tmdb_id];
-      var star = '<button type="button" class="star" data-fav="' + m.tmdb_id + '" aria-pressed="' + fav + '" aria-label="' +
-        (fav ? "Remove from favourites" : "Add to favourites") + '" title="' + (fav ? "Remove from favourites" : "Add to favourites") + '">' + STAR + "</button>";
       out.push('<li class="row"><div class="rank">' + (i + 1) + "</div>" + poster + '<div class="info"><div class="t">' + esc(m.title) +
-        (m.year ? ' <span class="y">' + m.year + "</span>" : "") + star + "</div>" + local + '<div class="meta">' + meta.join("") + "</div>" +
+        (m.year ? ' <span class="y">' + m.year + "</span>" : "") + buttons(m) + "</div>" + local + '<div class="meta">' + meta.join("") + "</div>" +
         (m.overview ? '<p class="plot"' + (openPlots[m.tmdb_id] ? "" : " hidden") + ' id="plot-' + m.tmdb_id + '">' + esc(m.overview) + "</p>" : "") + '</div><div class="scores">' +
         cell("RT", m.rt, m.rt == null ? null : m.rt + "%") +
         cell("Meta", m.mc, m.mc) +
         cell("IMDb", m.imdb == null ? null : m.imdb * 10, m.imdb == null ? null : m.imdb.toFixed(1), fmtVotes(m.imdb_votes)) +
         cell("Overall", m._o, m._o, "", "overall") + "</div></li>");
     });
-    var emptyMsg = state.view === "favs"
-      ? (state.favMovies.length ? "No favourites match your search." : "No favourites yet. Tap the star next to a movie's title to add it here.")
+    var emptyMsg = L
+      ? (L.movies.length ? L.emptySearch : L.empty)
       : state.movies.length
       ? 'No movies match these filters. Try fewer IMDb votes, another genre, or unticking "Has a Rotten Tomatoes score". Movies still waiting for scores show up once they have them.'
       : "TMDB lists no movies on this service in this country.";
@@ -1286,8 +1380,8 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
 
   var openPlots = {};
   $("list").addEventListener("click", function (e) {
-    var st = e.target.closest("[data-fav]");
-    if (st) { toggleFav(Number(st.getAttribute("data-fav"))); return; }
+    var t = e.target.closest("[data-list]");
+    if (t) { toggle(t.getAttribute("data-list"), Number(t.getAttribute("data-id"))); return; }
     var b = e.target.closest("[data-plot]");
     if (!b) return;
     var id = b.getAttribute("data-plot"), p = $("plot-" + id);
@@ -1303,111 +1397,135 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
     els[k].addEventListener("change", function () { state.shown = PAGE; render(); saveFilters(); });
   });
 
-  // ---------- favourites
-  function favCount() { return Object.keys(state.favIds).length; }
-  function updateFavCount() { $("favCount").textContent = favCount(); }
-
-  function availChips(m) {
-    var out = [], cur = state.country + "_" + state.service;
-    if (m.origin && m.origin.label && !m.origin.available)
-      out.push('<span class="avail gone">No longer on ' + esc(m.origin.label) + "</span>");
-    (m.where || []).forEach(function (w) {
-      out.push('<span class="avail">On ' + esc(w.label) + "</span>");
-    });
-    if (!out.length) out.push('<span class="avail unknown">Not on any catalog you\'ve loaded</span>');
-    return out;
+  // ---------- favourites and seen
+  function updateCounts() {
+    Object.keys(LISTS).forEach(function (k) { $(LISTS[k].badge).textContent = Object.keys(LISTS[k].ids).length; });
   }
 
-  function toggleFav(id) {
-    var adding = !state.favIds[id];
-    var src = state.view === "favs" ? state.favMovies : state.movies;
-    var m = src.filter(function (x) { return x.tmdb_id === id; })[0];
-    if (adding) state.favIds[id] = true; else delete state.favIds[id];
-    updateFavCount();
-    if (state.view === "favs" && !adding) state.favMovies = state.favMovies.filter(function (x) { return x.tmdb_id !== id; });
-    state.favLoaded = state.favLoaded && state.view === "favs";
+  function findMovie(id) {
+    var pools = [state.movies, LISTS.favs.movies, LISTS.seen.movies];
+    for (var i = 0; i < pools.length; i++) {
+      for (var j = 0; j < pools[i].length; j++) if (pools[i][j].tmdb_id === id) return pools[i][j];
+    }
+    return null;
+  }
+
+  function refreshView() {
     render();
-    if (state.view === "favs") updateFavStatus();
-    var body = adding && m ? { tmdb_id: id, title: m.title, title_local: m.title_local, original_title: m.original_title, year: m.year,
-      poster: m.poster, imdb_id: m.imdb_id, country: state.country, service: state.service } : { tmdb_id: id };
-    fetch(adding ? "/api/favourites/add" : "/api/favourites/remove", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
-      .then(function (r) { return r.json().then(function (j) { if (!r.ok) throw new Error(j.error || "Error " + r.status); return j; }); })
-      .then(function (j) {
-        state.favIds = {}; j.ids.forEach(function (x) { state.favIds[x] = true; }); updateFavCount();
-      })
-      .catch(function (e) {
-        if (adding) delete state.favIds[id]; else state.favIds[id] = true;
-        updateFavCount();
-        if (state.view === "favs") loadFavourites(); else render();
-        showNote((adding ? "Couldn't add that favourite. " : "Couldn't remove that favourite. ") +
-          (e.message.indexOf("Failed to fetch") >= 0 ? "Is streaming_ratings.py still running?" : e.message), true);
-      });
+    if (state.view === "all") updateStatus(); else updateListStatus();
   }
 
-  function loadFavourites() {
-    return api("/api/favourites").then(function (j) {
-      state.favMovies = j.favourites;
-      state.favMovies.forEach(function (m) { m._o = overall(m); m._s = [m.title, m.title_local, m.original_title].join(" ").toLowerCase(); });
-      state.favIds = {}; state.favMovies.forEach(function (m) { state.favIds[m.tmdb_id] = true; });
-      state.favLoaded = true;
-      updateFavCount();
-      if (state.view === "favs") { render(); updateFavStatus(); }
-    }).catch(function (e) { if (state.view === "favs") showNote(e.message, true); });
+  function toggle(name, id, opts) {
+    var L = LISTS[name], adding = !L.ids[id], m = (opts && opts.movie) || findMovie(id);
+    if (adding) L.ids[id] = true; else delete L.ids[id];
+    // Keep the open list in step right away; the server's copy follows.
+    if (state.view === name) {
+      if (adding && m) { var copy = Object.assign({}, m, { added: Date.now() / 1000 }); L.movies.push(copy); }
+      if (!adding) L.movies = L.movies.filter(function (x) { return x.tmdb_id !== id; });
+    }
+    updateCounts();
+    refreshView();
+    if (name === "seen" && !(opts && opts.quiet)) {
+      showToast((adding ? "Moved to Already seen: " : "Moved back to the list: ") + ((m && m.title) || "movie"), function () { toggle(name, id, { quiet: true, movie: m }); });
+    }
+    var body = { list: L.api, tmdb_id: id };
+    if (adding && m) {
+      body.title = m.title; body.title_local = m.title_local; body.original_title = m.original_title; body.year = m.year;
+      body.poster = m.poster; body.imdb_id = m.imdb_id;
+      body.country = (m.origin && m.origin.country) || state.country;
+      body.service = (m.origin && m.origin.service) || state.service;
+    }
+    post(adding ? "/api/list/add" : "/api/list/remove", body).then(function (j) {
+      L.ids = {}; j.ids.forEach(function (x) { L.ids[x] = true; });
+      updateCounts();
+      if (state.view === name && adding) loadList(name);
+    }).catch(function (e) {
+      if (adding) delete L.ids[id]; else L.ids[id] = true;
+      updateCounts();
+      if (state.view === name) loadList(name); else refreshView();
+      hideToast();
+      showNote("That change couldn't be saved. " + e.message, true);
+    });
   }
 
-  function updateFavStatus() {
-    var total = state.favMovies.length, cur = state.country + "_" + state.service;
-    var here = state.favMovies.filter(function (m) { return (m.where || []).some(function (w) { return w.country + "_" + w.service === cur; }); }).length;
-    var gone = state.favMovies.filter(function (m) { return m.origin && !m.origin.available; }).length;
-    var parts = ["<b>" + n(total) + "</b> favourite" + (total === 1 ? "" : "s")];
-    if (total && state.serviceName) parts.push("<b>" + n(here) + "</b> on " + esc(state.serviceName) + " · " + esc(state.countryName));
-    if (gone) parts.push("<b>" + n(gone) + "</b> no longer where you found " + (gone === 1 ? "it" : "them"));
-    $("status").innerHTML = parts.join(" · ");
+  function loadList(name) {
+    var L = LISTS[name];
+    return api("/api/list", { name: L.api }).then(function (j) {
+      L.movies = j.items; L.movies.forEach(prep);
+      L.ids = {}; L.movies.forEach(function (m) { L.ids[m.tmdb_id] = true; });
+      updateCounts();
+      if (state.view === name) refreshView();
+    }).catch(function (e) { if (state.view === name) showNote(e.message, true); });
   }
 
+  function showToast(text, undo) {
+    clearTimeout(timers.toast);
+    $("toastMsg").textContent = text;
+    $("toast").hidden = false;
+    $("toastUndo").onclick = function () { hideToast(); undo(); };
+    timers.toast = setTimeout(hideToast, 6000);
+  }
+  function hideToast() { clearTimeout(timers.toast); $("toast").hidden = true; }
+
+  // ---------- views
   function setView(view) {
     if (view === state.view) return;
     // Each view keeps its own sort order.
-    if (state.view === "favs") state.favSort = els.sort.value; else state.allSort = els.sort.value;
+    var prev = listView();
+    if (prev) prev.sort = els.sort.value; else state.allSort = els.sort.value;
     state.view = view;
-    document.body.classList.toggle("favs", view === "favs");
+    var L = listView();
+    document.body.classList.toggle("listview", !!L);
     $("tabAll").setAttribute("aria-selected", view === "all");
-    $("tabFavs").setAttribute("aria-selected", view === "favs");
-    $("optAdded").hidden = view !== "favs";
-    els.sort.value = view === "favs" ? state.favSort : (state.allSort || "overall");
-    if (els.sort.value === "" ) els.sort.value = "overall";
-    state.shown = PAGE; hideNote(); setHeading();
-    try { history.replaceState(null, "", location.pathname + location.search + (view === "favs" ? "#favourites" : "")); } catch (e) {}
-    if (view === "favs") {
+    Object.keys(LISTS).forEach(function (k) { $(LISTS[k].tab).setAttribute("aria-selected", view === k); });
+    $("optAdded").hidden = !L;
+    if (L) $("optAdded").textContent = L.sortLabel;
+    els.sort.value = L ? L.sort : state.allSort;
+    if (!els.sort.value) els.sort.value = "overall";
+    state.shown = PAGE; hideNote(); hideToast(); setHeading();
+    try { history.replaceState(null, "", location.pathname + location.search + (L ? L.hash : "")); } catch (e) {}
+    if (L) {
       $("loading").hidden = true; $("results").hidden = false;
-      render(); updateFavStatus();
-      loadFavourites();
+      refreshView();
+      loadList(view);
     } else {
       loadCatalog(false);
     }
     window.scrollTo(0, 0);
   }
+  function viewFromHash() {
+    for (var k in LISTS) if (location.hash === LISTS[k].hash) return k;
+    return "all";
+  }
   $("tabAll").addEventListener("click", function () { setView("all"); });
   $("tabFavs").addEventListener("click", function () { setView("favs"); });
+  $("tabSeen").addEventListener("click", function () { setView("seen"); });
   window.addEventListener("hashchange", function () {
-    var v = location.hash === "#favourites" ? "favs" : "all";
-    if (v === "favs" && !state.serviceName) { state.serviceName = selectedText(els.service); state.countryName = selectedText(els.country); }
+    var v = viewFromHash();
+    if (v !== "all" && !state.serviceName) syncNames();
     setView(v);
   });
 
+  var SORTS = ["overall", "rt", "mc", "imdb", "year", "title", "added"];
   function saveFilters() {
-    if (state.view === "favs") { state.favSort = els.sort.value; }
-    try { localStorage.setItem("sbr-filters", JSON.stringify({ sort: state.view === "favs" ? (state.allSort || "overall") : els.sort.value, favSort: state.favSort, votes: els.votes.value, from: els.from.value, needRt: els.needRt.checked, hideAnim: els.hideAnim.checked })); } catch (e) {}
+    var L = listView();
+    if (L) L.sort = els.sort.value; else state.allSort = els.sort.value;
+    try {
+      localStorage.setItem("sbr-filters", JSON.stringify({ sort: state.allSort, favSort: LISTS.favs.sort, seenSort: LISTS.seen.sort,
+        votes: els.votes.value, from: els.from.value, needRt: els.needRt.checked, hideAnim: els.hideAnim.checked }));
+    } catch (e) {}
   }
   function restoreFilters() {
     try {
       var f = JSON.parse(localStorage.getItem("sbr-filters") || "null");
       if (!f) return;
-      ["sort", "votes", "from"].forEach(function (k) {
+      ["votes", "from"].forEach(function (k) {
         if (f[k] != null && Array.prototype.some.call(els[k].options, function (o) { return o.value === f[k]; })) els[k].value = f[k];
       });
+      if (SORTS.indexOf(f.sort) >= 0 && f.sort !== "added") { state.allSort = f.sort; els.sort.value = f.sort; }
+      if (SORTS.indexOf(f.favSort) >= 0) LISTS.favs.sort = f.favSort;
+      if (SORTS.indexOf(f.seenSort) >= 0) LISTS.seen.sort = f.seenSort;
       els.needRt.checked = f.needRt !== false; els.hideAnim.checked = !!f.hideAnim;
-      if (["overall", "rt", "mc", "imdb", "year", "title", "added"].indexOf(f.favSort) >= 0) state.favSort = f.favSort;
     } catch (e) {}
   }
 
@@ -1418,13 +1536,11 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
     if (s) state.service = Number(s[1]);
   })();
   restoreFilters();
-  updateFavCount();
-  var startFavs = location.hash === "#favourites";
+  updateCounts();
+  var startView = viewFromHash();
   loadRegions().then(loadServices).then(function () {
-    if (startFavs) {
-      state.serviceName = selectedText(els.service); state.countryName = selectedText(els.country);
-      setView("favs");
-    } else loadCatalog(false);
+    if (startView !== "all") { syncNames(); setView(startView); }
+    else loadCatalog(false);
   }).catch(function (e) { showNote(e.message, true); });
 })();
 </script>

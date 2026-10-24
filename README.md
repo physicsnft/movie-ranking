@@ -12,6 +12,7 @@ Netflix and the other services group their catalogs into rows picked by an algor
 - **Three critic scores and an overall score.** The overall score is the average of the Rotten Tomatoes critics score, the Metascore, and the IMDb rating × 10.
 - **Filters.** Search by title (original or translated), and filter by genre, release year, a minimum number of IMDb votes, and whether a movie has a Rotten Tomatoes score.
 - **Favourites.** Star any movie to save it. The Favourites view shows every movie you starred, with its current scores and the catalogs you've loaded that it's on. It also flags movies that have left the service where you found them.
+- **Already seen.** Click the eye next to a movie once you've watched it. It disappears from the list and moves to the Already seen view, so the list only shows movies you haven't watched yet. An Undo button catches accidental clicks, and you can move a movie back at any time.
 - **Stays up to date.** Catalogs refresh once a day, so movies that leave a service disappear and new arrivals show up.
 - **One file, no dependencies.** It's a single Python script that uses only the standard library.
 - **Private.** Your API keys and data stay on your computer, and the site only accepts connections from your own machine.
@@ -55,7 +56,7 @@ Everything is cached in a `data` folder next to the script:
 - **Catalogs** refresh in the background once a day.
 - **Movie details** are kept for 90 days.
 - **Scores** are kept for 30 days, then refreshed. They're shared between all countries and services, so a movie is only looked up once.
-- **Favourites** are saved in `data/favourites.json`. To keep them when you move to another computer, copy that file over.
+- **Favourites** and **seen movies** are saved in `data/favourites.json` and `data/seen.json`. To keep them when you move to another computer, copy those files over.
 
 ### About the daily limit
 
