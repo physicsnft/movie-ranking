@@ -4,13 +4,14 @@ Every movie on a streaming service in your country, ranked by what critics think
 
 Netflix and the other services group their catalogs into rows picked by an algorithm, so there's no easy way to see everything that's available or sort it by quality. Streaming by Rating is a small website that runs on your own computer. Pick a country and a service, and it lists every movie available there with its **Rotten Tomatoes**, **Metacritic** and **IMDb** scores, sorted best first.
 
-![Streaming by Rating](screenshot.png)
+<!-- Add a screenshot here: ![Streaming by Rating](screenshot.png) -->
 
 ## Features
 
 - **Any country, any service.** Choose from every country and streaming service that TMDB tracks: Netflix, Prime Video, Disney+, Max, Filmin, and many more.
 - **Three critic scores and an overall score.** The overall score is the average of the Rotten Tomatoes critics score, the Metascore, and the IMDb rating × 10.
 - **Filters.** Search by title (original or translated), and filter by genre, release year, a minimum number of IMDb votes, and whether a movie has a Rotten Tomatoes score.
+- **Favourites.** Star any movie to save it. The Favourites view shows every movie you starred, with its current scores and the catalogs you've loaded that it's on. It also flags movies that have left the service where you found them.
 - **Stays up to date.** Catalogs refresh once a day, so movies that leave a service disappear and new arrivals show up.
 - **One file, no dependencies.** It's a single Python script that uses only the standard library.
 - **Private.** Your API keys and data stay on your computer, and the site only accepts connections from your own machine.
@@ -54,6 +55,7 @@ Everything is cached in a `data` folder next to the script:
 - **Catalogs** refresh in the background once a day.
 - **Movie details** are kept for 90 days.
 - **Scores** are kept for 30 days, then refreshed. They're shared between all countries and services, so a movie is only looked up once.
+- **Favourites** are saved in `data/favourites.json`. To keep them when you move to another computer, copy that file over.
 
 ### About the daily limit
 
@@ -94,6 +96,7 @@ data/
 - TMDB returns at most 10,000 movies for each service and country. Only the very largest catalogs reach that.
 - Some movies have no Rotten Tomatoes or Metacritic score, especially older, regional or very new ones. Untick **Has a Rotten Tomatoes score** to see them.
 - Only movies are included, not TV series.
+- The Favourites view can only tell where a movie is available among the country and service catalogs you've opened at least once.
 
 ## Credits
 

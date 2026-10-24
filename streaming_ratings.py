@@ -31,6 +31,9 @@ HOW THE DATA FILLS IN
     movies you haven't seen before get scores gradually, most popular
     first, while the site is running. Scores are shared between all
     countries and services, and kept in the data folder.
+  * Star a movie to add it to your favourites. The Favourites view shows
+    their current scores and which of your loaded catalogs they're on.
+    Favourites are saved in data/favourites.json.
   * Everything stays on your computer. The site only listens on
     localhost, so other devices on your network can't reach it.
 """
@@ -130,6 +133,12 @@ class Store:
         with self.lock:
             return list(self.data.items())
 
+    def pop(self, key):
+        with self.lock:
+            if key in self.data:
+                del self.data[key]
+                self.dirty = True
+
     def save(self):
         with self.lock:
             if self.dirty:
@@ -221,6 +230,8 @@ class App:
         self.scores = Store(os.path.join(DATA, "omdb_scores.json"))
         self.lists = Store(os.path.join(DATA, "lists.json"))
         self.usage = Store(os.path.join(DATA, "omdb_usage.json"))
+        self.favs = Store(os.path.join(DATA, "favourites.json"))
+        self.id_sets = {}
         self.catalogs = {}
         self.cat_lock = threading.Lock()
         self.jobs = {}
@@ -235,7 +246,7 @@ class App:
             self.save_all()
 
     def save_all(self):
-        for s in (self.details, self.scores, self.lists, self.usage):
+        for s in (self.details, self.scores, self.lists, self.usage, self.favs):
             try:
                 s.save()
             except OSError:
@@ -437,6 +448,94 @@ class App:
                     break
         return out
 
+    # ---- favourites
+
+    def country_name(self, code):
+        for r in self.lists.get("regions", {}).get("v", []):
+            if r["code"] == code:
+                return r["name"]
+        return code
+
+    def availability_index(self):
+        """tmdb id -> catalog keys it appears in, over every catalog loaded so far."""
+        index = {}
+        folder = os.path.join(DATA, "catalogs")
+        for name in sorted(os.listdir(folder)):
+            if not name.endswith(".json"):
+                continue
+            key = name[:-5]
+            cat = self.get_catalog(key)
+            if not cat:
+                continue
+            cached = self.id_sets.get(key)
+            if not cached or cached[0] != cat["fetched"]:
+                cached = (cat["fetched"], {m["id"] for m in cat["movies"]})
+                self.id_sets[key] = cached
+            for mid in cached[1]:
+                index.setdefault(mid, []).append(key)
+        return index
+
+    def favourites(self):
+        index = self.availability_index()
+        out = []
+        for fid, f in self.favs.items():
+            mid = int(fid)
+            d = self.details.get(fid) or {}
+            imdb_id = d.get("imdb_id") or f.get("imdb_id")
+            s = self.scores.get(imdb_id or "") or {}
+            where = []
+            for key in index.get(mid, []):
+                country, pid = key.split("_", 1)
+                where.append({"country": country, "service": int(pid),
+                              "label": f"{self.service_name(country, int(pid))} · {self.country_name(country)}"})
+            origin = f"{f.get('country')}_{f.get('service')}"
+            out.append({
+                "tmdb_id": mid,
+                "imdb_id": imdb_id,
+                "title": d.get("title") or f.get("title"),
+                "title_local": f.get("title_local"),
+                "original_title": f.get("original_title"),
+                "year": f.get("year"),
+                "runtime": d.get("runtime"),
+                "genres": d.get("genres", []),
+                "overview": d.get("overview") or "",
+                "poster": f.get("poster"),
+                "imdb": s.get("imdb"), "imdb_votes": s.get("imdb_votes"),
+                "rt": s.get("rt"), "mc": s.get("mc"),
+                "added": f.get("added"),
+                "where": where,
+                "origin": {"country": f.get("country"), "service": f.get("service"),
+                           "label": f"{self.service_name(f.get('country'), f.get('service'))} · {self.country_name(f.get('country'))}",
+                           "available": origin in index.get(mid, [])},
+            })
+        return out
+
+    def add_favourite(self, body):
+        mid = int(body["tmdb_id"])
+        country = str(body.get("country") or "")[:2].upper()
+        try:
+            service = int(body.get("service"))
+        except (TypeError, ValueError):
+            service = None
+        clip = lambda v: (str(v)[:300] if v is not None else None)
+        year = body.get("year")
+        self.favs.set(str(mid), {
+            "added": time.time(),
+            "title": clip(body.get("title")),
+            "title_local": clip(body.get("title_local")),
+            "original_title": clip(body.get("original_title")),
+            "year": year if isinstance(year, int) else None,
+            "poster": clip(body.get("poster")),
+            "imdb_id": clip(body.get("imdb_id")),
+            "country": country if re.fullmatch(r"[A-Z]{2}", country) else None,
+            "service": service,
+        })
+        self.favs.save()
+
+    def remove_favourite(self, mid):
+        self.favs.pop(str(int(mid)))
+        self.favs.save()
+
     # ---- OMDb daily budget
 
     def used_today(self):
@@ -541,7 +640,8 @@ def make_handler(app):
             path = urllib.parse.urlparse(self.path).path
             try:
                 if path == "/":
-                    boot = {"country": app.cfg.get("last_country", "ES"), "service": app.cfg.get("last_service", 8)}
+                    boot = {"country": app.cfg.get("last_country", "ES"), "service": app.cfg.get("last_service", 8),
+                            "favs": [int(k) for k, _ in app.favs.items()]}
                     self.send(200, PAGE.replace("__BOOT__", json.dumps(boot)), "text/html; charset=utf-8")
                 elif path == "/api/regions":
                     self.json({"regions": app.regions()})
@@ -554,12 +654,41 @@ def make_handler(app):
                     self.catalog()
                 elif path == "/api/scores":
                     self.scores()
+                elif path == "/api/favourites":
+                    self.json({"favourites": app.favourites()})
                 else:
                     self.send(404, "Not found", "text/plain; charset=utf-8")
             except ApiError as e:
                 self.json({"error": str(e)}, 502)
             except (BrokenPipeError, ConnectionResetError):
                 pass
+
+        def do_POST(self):
+            path = urllib.parse.urlparse(self.path).path
+            # Only the page served from this computer may change favourites.
+            origin = self.headers.get("Origin")
+            host = self.headers.get("Host", "")
+            if origin and urllib.parse.urlparse(origin).netloc != host:
+                return self.json({"error": "Not allowed."}, 403)
+            try:
+                length = min(int(self.headers.get("Content-Length") or 0), 100_000)
+                body = json.loads(self.rfile.read(length) or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError
+            except (ValueError, json.JSONDecodeError):
+                return self.json({"error": "That request couldn't be read."}, 400)
+            try:
+                if path == "/api/favourites/add":
+                    app.add_favourite(body)
+                elif path == "/api/favourites/remove":
+                    app.remove_favourite(body["tmdb_id"])
+                else:
+                    return self.send(404, "Not found", "text/plain; charset=utf-8")
+            except (KeyError, TypeError, ValueError):
+                return self.json({"error": "That request is missing the movie."}, 400)
+            except OSError:
+                return self.json({"error": "Your favourites couldn't be saved. Check the data folder can be written to."}, 500)
+            self.json({"ok": True, "ids": [int(k) for k, _ in app.favs.items()]})
 
         def catalog(self):
             country, pid, _, q = self.params()
@@ -761,18 +890,39 @@ li.row { background: var(--surface); border-radius: 8px; padding: 12px 14px; ali
   background: var(--surface); color: var(--ink); }
 .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
 .empty { padding: 32px 16px; text-align: center; color: var(--muted); background: var(--surface); border-radius: 8px; }
+nav.views { display: inline-flex; gap: 4px; padding: 4px; background: var(--chip); border-radius: 8px; margin-bottom: 18px; }
+.tab { font: 600 14px/1 var(--f-body); color: var(--muted); background: none; border: 0; border-radius: 6px; padding: 9px 14px; cursor: pointer;
+  display: inline-flex; gap: 8px; align-items: center; }
+.tab[aria-selected="true"] { background: var(--surface); color: var(--ink); }
+.tab .badge { font: 600 11.5px/1 var(--f-mono); background: var(--bg); color: var(--ink); border-radius: 4px; padding: 3px 6px; font-variant-numeric: tabular-nums; }
+.tab[aria-selected="true"] .badge { background: var(--chip); }
+.star { background: none; border: 0; padding: 2px; margin-left: 4px; cursor: pointer; vertical-align: -3px; color: var(--muted); border-radius: 4px; line-height: 0; }
+.star svg { width: 19px; height: 19px; display: block; }
+.star svg path { fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linejoin: round; }
+.star[aria-pressed="true"] { color: var(--mixed); }
+.star[aria-pressed="true"] svg path { fill: currentColor; }
+.star:hover { color: var(--mixed); }
+.avail { font-size: 11.5px; font-weight: 600; border-radius: 4px; padding: 1px 6px; color: var(--fresh); background: var(--fresh-bg); }
+.avail.gone { color: var(--low); background: var(--low-bg); }
+.avail.unknown { color: var(--muted); background: var(--chip); }
+body.favs .source, body.favs .allonly { display: none !important; }
+body.favs .controls { grid-template-columns: 2fr minmax(0, 1fr); max-width: 640px; }
 footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76ch; }
 @media (prefers-reduced-motion: reduce) { .bar span { transition: none; } }
 </style>
 </head>
 <body>
 <div class="wrap">
+  <nav class="views" role="tablist" aria-label="View">
+    <button class="tab" type="button" role="tab" id="tabAll" aria-selected="true">All movies</button>
+    <button class="tab" type="button" role="tab" id="tabFavs" aria-selected="false">Favourites <span class="badge" id="favCount">0</span></button>
+  </nav>
   <div class="source">
     <div class="field"><label for="country">Country</label><select id="country"><option>Loading…</option></select></div>
     <div class="field"><label for="service">Streaming service</label><select id="service"><option>Loading…</option></select></div>
   </div>
 
-  <h1><span class="svc" id="hService">&nbsp;</span><br><span id="hCountry">&nbsp;</span> by rating</h1>
+  <h1><span class="svc" id="hService">&nbsp;</span><br><span id="hCountry">&nbsp;</span><span id="hBy"> by rating</span></h1>
   <div class="status" id="status" aria-live="polite"></div>
   <div class="note" id="note" hidden></div>
 
@@ -793,9 +943,10 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
           <option value="imdb">IMDb</option>
           <option value="year">Newest</option>
           <option value="title">Title A–Z</option>
+          <option value="added" id="optAdded" hidden>Recently added</option>
         </select></div>
-      <div class="field"><label for="genre">Genre</label><select id="genre"><option value="">All genres</option></select></div>
-      <div class="field"><label for="votes">IMDb votes</label>
+      <div class="field allonly"><label for="genre">Genre</label><select id="genre"><option value="">All genres</option></select></div>
+      <div class="field allonly"><label for="votes">IMDb votes</label>
         <select id="votes">
           <option value="0">Any</option>
           <option value="1000">1,000+</option>
@@ -803,7 +954,7 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
           <option value="50000">50,000+</option>
           <option value="200000">200,000+</option>
         </select></div>
-      <div class="field"><label for="from">Released</label>
+      <div class="field allonly"><label for="from">Released</label>
         <select id="from">
           <option value="0">Any year</option>
           <option value="2020">2020 or later</option>
@@ -813,8 +964,8 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
         </select></div>
     </div>
     <div class="toggles">
-      <label><input type="checkbox" id="needRt" checked> Has a Rotten Tomatoes score</label>
-      <label><input type="checkbox" id="hideAnim"> Hide animation</label>
+      <label class="allonly"><input type="checkbox" id="needRt" checked> Has a Rotten Tomatoes score</label>
+      <label class="allonly"><input type="checkbox" id="hideAnim"> Hide animation</label>
       <span class="count" id="count"></span>
     </div>
 
@@ -840,7 +991,10 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
   var els = { country: $("country"), service: $("service"), q: $("q"), sort: $("sort"), genre: $("genre"),
     votes: $("votes"), from: $("from"), needRt: $("needRt"), hideAnim: $("hideAnim") };
   var state = { country: BOOT.country, service: BOOT.service, movies: [], byImdb: {}, since: 0, shown: PAGE, token: 0,
-    serviceName: "", countryName: "", fetched: 0, scorer: null };
+    serviceName: "", countryName: "", fetched: 0, scorer: null,
+    view: "all", favIds: {}, favMovies: [], favLoaded: false, favSort: "overall", allSort: null };
+  (BOOT.favs || []).forEach(function (id) { state.favIds[id] = true; });
+  var STAR = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.2l2.7 5.6 6.1.8-4.5 4.2 1.1 6.1L12 17l-5.4 2.9 1.1-6.1-4.5-4.2 6.1-.8z"/></svg>';
   var timers = { job: null, scores: null };
 
   // ---------- helpers
@@ -877,6 +1031,14 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
   }
   function hideNote() { $("note").hidden = true; }
   function setHeading() {
+    if (state.view === "favs") {
+      $("hService").textContent = "Your";
+      $("hCountry").textContent = "favourites";
+      $("hBy").hidden = true;
+      document.title = "Favourites · Streaming by Rating";
+      return;
+    }
+    $("hBy").hidden = false;
     $("hService").textContent = state.serviceName || " ";
     $("hCountry").textContent = state.countryName || " ";
     document.title = (state.serviceName ? state.serviceName + " " + state.countryName + " by Rating" : "Streaming by Rating");
@@ -922,6 +1084,7 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
 
   // ---------- catalog
   function showLoading(job) {
+    if (state.view === "favs") return;
     $("results").hidden = true; $("loading").hidden = false;
     var pct = 0, msg = "Getting the " + state.serviceName + " catalog for " + state.countryName + "…", sub = "This takes a minute or so the first time. After that it's instant.";
     if (job && job.step === "catalog" && job.total) { pct = 50 * job.done / job.total; sub = "Page " + n(job.done) + " of " + n(job.total) + " of the catalog."; }
@@ -942,7 +1105,7 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
     state.serviceName = selectedText(els.service); state.countryName = selectedText(els.country);
     setHeading();
     $("status").textContent = "";
-    try { history.replaceState(null, "", "?country=" + state.country + "&service=" + state.service); } catch (e) {}
+    try { history.replaceState(null, "", "?country=" + state.country + "&service=" + state.service + (state.view === "favs" ? "#favourites" : "")); } catch (e) {}
     var params = { country: state.country, service: state.service };
     if (retry) params.retry = 1;
     api("/api/catalog", params).then(function (j) {
@@ -965,14 +1128,16 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
   }
 
   function useCatalog(j) {
-    $("loading").hidden = true; $("results").hidden = false;
+    $("loading").hidden = true;
+    if (state.view === "all") $("results").hidden = false;
     state.movies = j.movies; state.fetched = j.fetched; state.since = j.now || 0; state.shown = PAGE;
     state.byImdb = {};
     state.movies.forEach(function (m) {
       m._o = overall(m); m._s = [m.title, m.title_local, m.original_title].join(" ").toLowerCase();
       if (m.imdb_id) (state.byImdb[m.imdb_id] = state.byImdb[m.imdb_id] || []).push(m);
     });
-    buildGenres(); render(); updateStatus();
+    buildGenres();
+    if (state.view === "all") { render(); updateStatus(); }
     pollScores(state.token);
     // A catalog older than a day refreshes in the background; reload it quietly when done.
     if (j.job && j.job.state === "running") watchRefresh(state.token);
@@ -1006,8 +1171,8 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
           changed = true;
         });
       });
-      if (changed) render();
-      updateStatus();
+      if (changed && state.view === "all") render();
+      if (state.view === "all") updateStatus();
       var busy = j.scorer.state === "running" && j.scorer.pending > 0;
       timers.scores = setTimeout(function () { pollScores(token); }, busy ? 8000 : 60000);
     }).catch(function () {
@@ -1046,8 +1211,10 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
 
   function filtered() {
     var q = els.q.value.trim().toLowerCase(), g = els.genre.value, minV = +els.votes.value, from = +els.from.value, key = els.sort.value;
-    var list = state.movies.filter(function (m) {
+    var favView = state.view === "favs";
+    var list = (favView ? state.favMovies : state.movies).filter(function (m) {
       if (q && m._s.indexOf(q) < 0) return false;
+      if (favView) return true;
       if (g && (m.genres || []).indexOf(g) < 0) return false;
       if (minV && !(m.imdb_votes >= minV)) return false;
       if (from && !(m.year >= from)) return false;
@@ -1058,6 +1225,7 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
     var f = { overall: "_o", rt: "rt", mc: "mc", imdb: "imdb", year: "year" }[key];
     list.sort(function (a, b) {
       if (key === "title") return String(a.title).localeCompare(String(b.title));
+      if (key === "added") return (b.added || 0) - (a.added || 0);
       var x = a[f], y = b[f];
       if (x == null && y == null) return (b._o || 0) - (a._o || 0);
       if (x == null) return 1;
@@ -1073,6 +1241,10 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
   }
 
   function watchLink(m) {
+    if (state.view === "favs") {
+      var c = (m.origin && m.origin.country) || state.country;
+      return '<a href="https://www.themoviedb.org/movie/' + m.tmdb_id + "/watch?locale=" + encodeURIComponent(c) + '" target="_blank" rel="noopener">Where to watch ↗</a>';
+    }
     if (/^netflix/i.test(state.serviceName))
       return '<a href="https://www.netflix.com/search?q=' + encodeURIComponent(m.title_local || m.title) + '" target="_blank" rel="noopener">Netflix ↗</a>';
     return '<a href="https://www.themoviedb.org/movie/' + m.tmdb_id + "/watch?locale=" + encodeURIComponent(state.country) + '" target="_blank" rel="noopener">Where to watch ↗</a>';
@@ -1083,6 +1255,7 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
     $("count").textContent = n(list.length) + " match" + (list.length === 1 ? "" : "es");
     list.slice(0, state.shown).forEach(function (m, i) {
       var meta = [];
+      if (state.view === "favs") meta = meta.concat(availChips(m));
       if (m.genres && m.genres.length) meta.push("<span>" + esc(m.genres.slice(0, 3).join(", ")) + "</span>");
       if (m.runtime) meta.push("<span>" + m.runtime + " min</span>");
       meta.push(watchLink(m));
@@ -1090,15 +1263,20 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
       if (m.overview) meta.push('<button type="button" data-plot="' + m.tmdb_id + '">Plot</button>');
       var local = m.title_local && m.title_local !== m.title ? '<div class="sub">' + esc(m.title_local) + "</div>" : "";
       var poster = m.poster ? '<img class="poster" loading="lazy" alt="" src="https://image.tmdb.org/t/p/w92' + esc(m.poster) + '">' : '<div class="poster"></div>';
+      var fav = !!state.favIds[m.tmdb_id];
+      var star = '<button type="button" class="star" data-fav="' + m.tmdb_id + '" aria-pressed="' + fav + '" aria-label="' +
+        (fav ? "Remove from favourites" : "Add to favourites") + '" title="' + (fav ? "Remove from favourites" : "Add to favourites") + '">' + STAR + "</button>";
       out.push('<li class="row"><div class="rank">' + (i + 1) + "</div>" + poster + '<div class="info"><div class="t">' + esc(m.title) +
-        (m.year ? ' <span class="y">' + m.year + "</span>" : "") + "</div>" + local + '<div class="meta">' + meta.join("") + "</div>" +
+        (m.year ? ' <span class="y">' + m.year + "</span>" : "") + star + "</div>" + local + '<div class="meta">' + meta.join("") + "</div>" +
         (m.overview ? '<p class="plot"' + (openPlots[m.tmdb_id] ? "" : " hidden") + ' id="plot-' + m.tmdb_id + '">' + esc(m.overview) + "</p>" : "") + '</div><div class="scores">' +
         cell("RT", m.rt, m.rt == null ? null : m.rt + "%") +
         cell("Meta", m.mc, m.mc) +
         cell("IMDb", m.imdb == null ? null : m.imdb * 10, m.imdb == null ? null : m.imdb.toFixed(1), fmtVotes(m.imdb_votes)) +
         cell("Overall", m._o, m._o, "", "overall") + "</div></li>");
     });
-    var emptyMsg = state.movies.length
+    var emptyMsg = state.view === "favs"
+      ? (state.favMovies.length ? "No favourites match your search." : "No favourites yet. Tap the star next to a movie's title to add it here.")
+      : state.movies.length
       ? 'No movies match these filters. Try fewer IMDb votes, another genre, or unticking "Has a Rotten Tomatoes score". Movies still waiting for scores show up once they have them.'
       : "TMDB lists no movies on this service in this country.";
     $("list").innerHTML = out.length ? out.join("") : '<li class="empty">' + esc(emptyMsg) + "</li>";
@@ -1108,6 +1286,8 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
 
   var openPlots = {};
   $("list").addEventListener("click", function (e) {
+    var st = e.target.closest("[data-fav]");
+    if (st) { toggleFav(Number(st.getAttribute("data-fav"))); return; }
     var b = e.target.closest("[data-plot]");
     if (!b) return;
     var id = b.getAttribute("data-plot"), p = $("plot-" + id);
@@ -1123,8 +1303,101 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
     els[k].addEventListener("change", function () { state.shown = PAGE; render(); saveFilters(); });
   });
 
+  // ---------- favourites
+  function favCount() { return Object.keys(state.favIds).length; }
+  function updateFavCount() { $("favCount").textContent = favCount(); }
+
+  function availChips(m) {
+    var out = [], cur = state.country + "_" + state.service;
+    if (m.origin && m.origin.label && !m.origin.available)
+      out.push('<span class="avail gone">No longer on ' + esc(m.origin.label) + "</span>");
+    (m.where || []).forEach(function (w) {
+      out.push('<span class="avail">On ' + esc(w.label) + "</span>");
+    });
+    if (!out.length) out.push('<span class="avail unknown">Not on any catalog you\'ve loaded</span>');
+    return out;
+  }
+
+  function toggleFav(id) {
+    var adding = !state.favIds[id];
+    var src = state.view === "favs" ? state.favMovies : state.movies;
+    var m = src.filter(function (x) { return x.tmdb_id === id; })[0];
+    if (adding) state.favIds[id] = true; else delete state.favIds[id];
+    updateFavCount();
+    if (state.view === "favs" && !adding) state.favMovies = state.favMovies.filter(function (x) { return x.tmdb_id !== id; });
+    state.favLoaded = state.favLoaded && state.view === "favs";
+    render();
+    if (state.view === "favs") updateFavStatus();
+    var body = adding && m ? { tmdb_id: id, title: m.title, title_local: m.title_local, original_title: m.original_title, year: m.year,
+      poster: m.poster, imdb_id: m.imdb_id, country: state.country, service: state.service } : { tmdb_id: id };
+    fetch(adding ? "/api/favourites/add" : "/api/favourites/remove", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
+      .then(function (r) { return r.json().then(function (j) { if (!r.ok) throw new Error(j.error || "Error " + r.status); return j; }); })
+      .then(function (j) {
+        state.favIds = {}; j.ids.forEach(function (x) { state.favIds[x] = true; }); updateFavCount();
+      })
+      .catch(function (e) {
+        if (adding) delete state.favIds[id]; else state.favIds[id] = true;
+        updateFavCount();
+        if (state.view === "favs") loadFavourites(); else render();
+        showNote((adding ? "Couldn't add that favourite. " : "Couldn't remove that favourite. ") +
+          (e.message.indexOf("Failed to fetch") >= 0 ? "Is streaming_ratings.py still running?" : e.message), true);
+      });
+  }
+
+  function loadFavourites() {
+    return api("/api/favourites").then(function (j) {
+      state.favMovies = j.favourites;
+      state.favMovies.forEach(function (m) { m._o = overall(m); m._s = [m.title, m.title_local, m.original_title].join(" ").toLowerCase(); });
+      state.favIds = {}; state.favMovies.forEach(function (m) { state.favIds[m.tmdb_id] = true; });
+      state.favLoaded = true;
+      updateFavCount();
+      if (state.view === "favs") { render(); updateFavStatus(); }
+    }).catch(function (e) { if (state.view === "favs") showNote(e.message, true); });
+  }
+
+  function updateFavStatus() {
+    var total = state.favMovies.length, cur = state.country + "_" + state.service;
+    var here = state.favMovies.filter(function (m) { return (m.where || []).some(function (w) { return w.country + "_" + w.service === cur; }); }).length;
+    var gone = state.favMovies.filter(function (m) { return m.origin && !m.origin.available; }).length;
+    var parts = ["<b>" + n(total) + "</b> favourite" + (total === 1 ? "" : "s")];
+    if (total && state.serviceName) parts.push("<b>" + n(here) + "</b> on " + esc(state.serviceName) + " · " + esc(state.countryName));
+    if (gone) parts.push("<b>" + n(gone) + "</b> no longer where you found " + (gone === 1 ? "it" : "them"));
+    $("status").innerHTML = parts.join(" · ");
+  }
+
+  function setView(view) {
+    if (view === state.view) return;
+    // Each view keeps its own sort order.
+    if (state.view === "favs") state.favSort = els.sort.value; else state.allSort = els.sort.value;
+    state.view = view;
+    document.body.classList.toggle("favs", view === "favs");
+    $("tabAll").setAttribute("aria-selected", view === "all");
+    $("tabFavs").setAttribute("aria-selected", view === "favs");
+    $("optAdded").hidden = view !== "favs";
+    els.sort.value = view === "favs" ? state.favSort : (state.allSort || "overall");
+    if (els.sort.value === "" ) els.sort.value = "overall";
+    state.shown = PAGE; hideNote(); setHeading();
+    try { history.replaceState(null, "", location.pathname + location.search + (view === "favs" ? "#favourites" : "")); } catch (e) {}
+    if (view === "favs") {
+      $("loading").hidden = true; $("results").hidden = false;
+      render(); updateFavStatus();
+      loadFavourites();
+    } else {
+      loadCatalog(false);
+    }
+    window.scrollTo(0, 0);
+  }
+  $("tabAll").addEventListener("click", function () { setView("all"); });
+  $("tabFavs").addEventListener("click", function () { setView("favs"); });
+  window.addEventListener("hashchange", function () {
+    var v = location.hash === "#favourites" ? "favs" : "all";
+    if (v === "favs" && !state.serviceName) { state.serviceName = selectedText(els.service); state.countryName = selectedText(els.country); }
+    setView(v);
+  });
+
   function saveFilters() {
-    try { localStorage.setItem("sbr-filters", JSON.stringify({ sort: els.sort.value, votes: els.votes.value, from: els.from.value, needRt: els.needRt.checked, hideAnim: els.hideAnim.checked })); } catch (e) {}
+    if (state.view === "favs") { state.favSort = els.sort.value; }
+    try { localStorage.setItem("sbr-filters", JSON.stringify({ sort: state.view === "favs" ? (state.allSort || "overall") : els.sort.value, favSort: state.favSort, votes: els.votes.value, from: els.from.value, needRt: els.needRt.checked, hideAnim: els.hideAnim.checked })); } catch (e) {}
   }
   function restoreFilters() {
     try {
@@ -1134,6 +1407,7 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
         if (f[k] != null && Array.prototype.some.call(els[k].options, function (o) { return o.value === f[k]; })) els[k].value = f[k];
       });
       els.needRt.checked = f.needRt !== false; els.hideAnim.checked = !!f.hideAnim;
+      if (["overall", "rt", "mc", "imdb", "year", "title", "added"].indexOf(f.favSort) >= 0) state.favSort = f.favSort;
     } catch (e) {}
   }
 
@@ -1144,8 +1418,14 @@ footer { margin-top: 32px; font-size: 12.5px; color: var(--muted); max-width: 76
     if (s) state.service = Number(s[1]);
   })();
   restoreFilters();
-  loadRegions().then(loadServices).then(function () { loadCatalog(false); })
-    .catch(function (e) { showNote(e.message, true); });
+  updateFavCount();
+  var startFavs = location.hash === "#favourites";
+  loadRegions().then(loadServices).then(function () {
+    if (startFavs) {
+      state.serviceName = selectedText(els.service); state.countryName = selectedText(els.country);
+      setView("favs");
+    } else loadCatalog(false);
+  }).catch(function (e) { showNote(e.message, true); });
 })();
 </script>
 </body>
